@@ -43,7 +43,7 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/VanL/phaselock"
 Documentation = "https://github.com/VanL/phaselock#readme"
-Repository = "git@github.com:VanL/phaselock.git"
+Repository = "https://github.com/VanL/phaselock"
 Issues = "https://github.com/VanL/phaselock/issues"
 
 [tool.hatch.build.targets.sdist]

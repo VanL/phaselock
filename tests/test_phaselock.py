@@ -10,6 +10,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -259,7 +260,7 @@ def test_darwin_xattr_provider_gets_and_sets_values_through_libc(
         assert key == b"user.phaselock.phase"
         if buffer is None:
             return len(value)
-        ctypes.memmove(buffer, value, len(value))
+        ctypes.memmove(cast(Any, buffer), value, len(value))
         return len(value)
 
     def setxattr(
@@ -271,7 +272,14 @@ def test_darwin_xattr_provider_gets_and_sets_values_through_libc(
         options: int,
     ) -> int:
         set_calls.append(
-            (path, key, ctypes.string_at(buffer, size), size, position, options)
+            (
+                path,
+                key,
+                ctypes.string_at(cast(Any, buffer), size),
+                size,
+                position,
+                options,
+            )
         )
         return 0
 
@@ -320,9 +328,7 @@ def test_darwin_xattr_provider_returns_empty_value_without_second_read(
 
     assert provider is not None
     assert provider.get_value(target, "user.phaselock.empty") == b""
-    assert calls == [
-        (os.fsencode(target), b"user.phaselock.empty", None, 0, 0, 0)
-    ]
+    assert calls == [(os.fsencode(target), b"user.phaselock.empty", None, 0, 0, 0)]
 
 
 def test_darwin_xattr_provider_retries_get_when_value_grows(
@@ -351,7 +357,8 @@ def test_darwin_xattr_provider_retries_get_when_value_grows(
             return -1
         if len(calls) == 3:
             return len(value)
-        ctypes.memmove(buffer, value, len(value))
+        assert buffer is not None
+        ctypes.memmove(cast(Any, buffer), value, len(value))
         return len(value)
 
     _install_fake_darwin_libc(monkeypatch, getxattr)
@@ -1183,7 +1190,7 @@ def test_status_reader_reports_stat_and_read_errors(
 ) -> None:
     service = PhaseLockService(tmp_path / "broker.db", use_xattrs=False)
     service.status_base_path.write_text("connection-v1\n", encoding="utf-8")
-    real_stat = Path.stat
+    real_stat: Callable[..., os.stat_result] = Path.stat
     real_read_bytes = Path.read_bytes
 
     def fail_stat(self: Path, *args: object, **kwargs: object) -> os.stat_result:
@@ -1415,7 +1422,7 @@ def test_process_local_lock_serializes_threads(tmp_path: Path) -> None:
     first_entered = threading.Event()
     release_first = threading.Event()
     calls: list[str] = []
-    results: dict[str, object] = {}
+    results: dict[str, PhaseRunResult] = {}
 
     def first_action() -> None:
         calls.append("first")

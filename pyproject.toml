@@ -1,0 +1,117 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "phaselock"
+version = "1.0"
+description = "A small vendorable phase and advisory file locking helper"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+license-files = ["LICENSE"]
+authors = [
+    {name = "Van Lindberg", email = "van.lindberg@gmail.com"},
+]
+keywords = ["advisory-lock", "file-locking", "sqlite", "vendorable", "xattr"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Filesystems",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.2",
+    "mypy>=1.0",
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pytest-xdist>=3.0",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/VanL/phaselock"
+Documentation = "https://github.com/VanL/phaselock#readme"
+Repository = "git@github.com:VanL/phaselock.git"
+Issues = "https://github.com/VanL/phaselock/issues"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/phaselock.py",
+    "/tests",
+    "/README.md",
+    "/VENDORING.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
+
+[tool.hatch.build.targets.wheel]
+only-include = ["phaselock.py"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = "-ra -q --strict-markers -n auto --dist loadgroup"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "B",
+    "C4",
+    "UP",
+]
+ignore = [
+    "E501",
+    "B008",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["phaselock"]
+
+[tool.coverage.run]
+source = ["phaselock"]
+branch = true
+parallel = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
+show_missing = true
+
+[tool.coverage.xml]
+output = "coverage.xml"

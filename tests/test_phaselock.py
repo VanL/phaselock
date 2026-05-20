@@ -105,7 +105,7 @@ def test_stdlib_xattr_provider_wraps_get_and_set_values_as_bytes(
 
     assert provider is not None
     assert provider.get_value(target, "user.phaselock.phase") == b"done"
-    provider.set_value(target, "user.phaselock.phase", bytearray(b"1"))
+    provider.set_value(target, "user.phaselock.phase", cast(Any, bytearray(b"1")))
     assert calls == [(target, "user.phaselock.phase", b"1")]
 
 
@@ -288,7 +288,7 @@ def test_darwin_xattr_provider_gets_and_sets_values_through_libc(
 
     assert provider is not None
     assert provider.get_value(target, "user.phaselock.phase") == value
-    provider.set_value(target, "user.phaselock.phase", bytearray(b"1"))
+    provider.set_value(target, "user.phaselock.phase", cast(Any, bytearray(b"1")))
     assert [(call[3], call[4], call[5]) for call in get_calls] == [
         (0, 0, 0),
         (len(value), 0, 0),

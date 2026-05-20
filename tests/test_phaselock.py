@@ -290,7 +290,11 @@ def test_has_phase_uses_status_file_when_xattrs_are_disabled(tmp_path: Path) -> 
 def test_empty_phase_list_in_status_mode_returns_no_status_paths(
     tmp_path: Path,
 ) -> None:
-    service = PhaseLockService(tmp_path / "broker.db", use_xattrs=False)
+    service = PhaseLockService(
+        tmp_path / "broker.db",
+        use_xattrs=False,
+        strict_marker_locking=True,
+    )
 
     result = service.run_phases(())
 

@@ -577,6 +577,15 @@ class PhaseLockService:
         """
 
         phase_list = tuple(phases)
+        if not phase_list:
+            return PhaseRunResult(
+                completed=(),
+                skipped=(),
+                xattrs_available=self.xattrs_available,
+                lock_path=self.lock_path,
+                status_paths=(),
+            )
+
         using_xattrs = self._should_use_xattrs()
         if not self.strict_marker_locking and self._all_marked(
             phase_list, using_xattrs=using_xattrs

@@ -55,7 +55,7 @@ jobs:
 
       - name: Test import
         run: |
-          python -c "from phaselock import __version__; assert __version__ == '1.1.0'"
+          python -c "from phaselock import __version__; assert __version__ == '1.2'"
 
   lint:
     runs-on: ubuntu-latest
@@ -113,7 +113,7 @@ jobs:
         run: |
           python -m venv /tmp/phaselock-smoke
           /tmp/phaselock-smoke/bin/python -m pip install dist/*.whl
-          /tmp/phaselock-smoke/bin/python -c "from phaselock import __version__; assert __version__ == '1.1.0'"
+          /tmp/phaselock-smoke/bin/python -c "from phaselock import __version__; assert __version__ == '1.2'"
 
   coverage:
     runs-on: ubuntu-latest

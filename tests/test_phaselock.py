@@ -1839,7 +1839,6 @@ def test_advisory_file_lock_create_parent_control(tmp_path: Path) -> None:
         assert lock_path.exists()
 
 
-
 def test_advisory_lock_unavailable_without_lock_primitives(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2249,3 +2248,128 @@ def test_fork_child_replaces_inherited_process_locks(
         assert not holder.is_alive(), "parent lock holder leaked"
     with AdvisoryFileLock(lock_path, timeout=1.0, retry_delay=0.01):
         assert lock_path.exists()
+
+
+def test_reset_darwin_xattr_lock_after_fork() -> None:
+    phaselock_module._PROCESS_LOCKS[Path("/dummy")] = threading.RLock()
+    phaselock_module._reset_darwin_xattr_lock_after_fork()
+    assert phaselock_module._PROCESS_LOCKS == {}
+    assert phaselock_module._PROCESS_LOCKS_GUARD is not None
+    assert phaselock_module._DARWIN_XATTR_PROVIDER_LOCK is not None
+
+
+def test_darwin_xattr_provider_returns_none_on_non_darwin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(phaselock_module, "_platform", "linux")
+    assert phaselock_module._darwin_xattr_provider() is None
+
+
+def test_darwin_xattr_provider_returns_cached_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_provider = phaselock_module._XattrProvider(
+        lambda p, k: b"", lambda p, k, v: None
+    )
+    monkeypatch.setattr(phaselock_module, "_platform", "darwin")
+    monkeypatch.setattr(phaselock_module, "_DARWIN_XATTR_PROVIDER", fake_provider)
+    assert phaselock_module._darwin_xattr_provider() is fake_provider
+
+
+def test_get_xattr_value(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = tmp_path / "data.db"
+    target.touch()
+    service = PhaseLockService(target, use_xattrs=False)
+    assert service.get_xattr_value("phase1") is None
+
+    provider = phaselock_module._XattrProvider(
+        lambda p, k: b"val", lambda p, k, v: None
+    )
+    monkeypatch.setattr(phaselock_module, "_xattr_provider", lambda: provider)
+    service_with_xattrs = PhaseLockService(target, use_xattrs=True)
+    assert service_with_xattrs.get_xattr_value("phase1") == b"val"
+
+
+def test_discard_status_cleans_fallback_status_in_xattr_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "data.db"
+    target.touch()
+    provider = phaselock_module._XattrProvider(lambda p, k: b"", lambda p, k, v: None)
+    monkeypatch.setattr(phaselock_module, "_xattr_provider", lambda: provider)
+    service = PhaseLockService(target, use_xattrs=True)
+    service.status_base_path.write_bytes(b"stale\n")
+    assert service.status_base_path.exists()
+
+    real_unlink = Path.unlink
+
+    def failing_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path == service.status_base_path:
+            raise OSError(errno.EACCES, "cannot unlink")
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    service.run_phases(
+        (Phase("p1", lambda: None),),
+        discard_status_if=lambda: True,
+    )
+    assert service.status_base_path.read_bytes() == b""
+
+
+def test_advisory_lock_stops_waiting_when_requested(tmp_path: Path) -> None:
+    lock_path = tmp_path / "test.lock"
+    lock = AdvisoryFileLock(lock_path, timeout=5.0, retry_delay=0.01)
+    assert not lock.acquire(should_stop_waiting=lambda: True)
+    assert not lock.locked
+
+
+def test_advisory_lock_stops_waiting_on_open_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = tmp_path / "test.lock"
+    lock = AdvisoryFileLock(lock_path, timeout=5.0, retry_delay=0.01)
+    call_count = 0
+
+    def stop() -> bool:
+        nonlocal call_count
+        call_count += 1
+        return call_count > 1
+
+    monkeypatch.setattr(
+        Path, "open", lambda *a, **k: (_ for _ in ()).throw(OSError("busy"))
+    )
+    assert not lock.acquire(should_stop_waiting=stop)
+
+
+def test_status_file_fsync_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(phaselock_module, "_status_file_fsync_enabled", lambda: False)
+    target = tmp_path / "data.db"
+    target.touch()
+    service = PhaseLockService(target, use_xattrs=False)
+    service.run_phases((Phase("p1", lambda: None),))
+    assert service._has_status_phase("p1")
+
+
+def test_write_status_phases_cleans_up_on_write_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "data.db"
+    target.touch()
+    service = PhaseLockService(target, use_xattrs=False)
+    monkeypatch.setattr(
+        os, "replace", lambda *a: (_ for _ in ()).throw(RuntimeError("disk fail"))
+    )
+    with pytest.raises(RuntimeError, match="disk fail"):
+        service._write_status_phases(["p1"])
+
+
+def test_write_status_phases_o_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "data.db"
+    target.touch()
+    service = PhaseLockService(target, use_xattrs=False)
+    monkeypatch.setattr(os, "O_BINARY", 0, raising=False)
+    service._write_status_phases(["p1"])

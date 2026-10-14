@@ -15,7 +15,7 @@ $ uv add phaselock
 Or vendor the single source file:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/VanL/phaselock/v1.0/phaselock.py
+curl -fsSLO https://raw.githubusercontent.com/VanL/phaselock/v1.1.0/phaselock.py
 ```
 
 Phaselock exists for code that needs one process to perform file-backed setup
@@ -120,7 +120,7 @@ import from your local module.
 
 ```bash
 curl -fsSLo your_project/_vendor/phaselock.py \
-  https://raw.githubusercontent.com/VanL/phaselock/v1.0/phaselock.py
+  https://raw.githubusercontent.com/VanL/phaselock/v1.1.0/phaselock.py
 ```
 
 Recommended vendored import:

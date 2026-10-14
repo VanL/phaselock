@@ -9,7 +9,7 @@ Copy from a tagged release:
 
 ```bash
 curl -fsSLo your_project/_vendor/phaselock.py \
-  https://raw.githubusercontent.com/VanL/phaselock/v1.0/phaselock.py
+  https://raw.githubusercontent.com/VanL/phaselock/v1.1.0/phaselock.py
 ```
 
 Use a local import wrapper if you want to hide the vendored path from your

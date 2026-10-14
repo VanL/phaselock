@@ -27,7 +27,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import BinaryIO, cast
 
-__version__ = "1.0"
+__version__ = "1.1.0"
 
 try:  # Unix/Linux/macOS
     import fcntl

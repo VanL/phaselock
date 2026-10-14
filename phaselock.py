@@ -68,12 +68,33 @@ _XATTR_ENV_ENABLED = {"1", "true", "yes", "on", "xattr", "xattrs"}
 _XATTR_ENV_DISABLED = {"0", "false", "no", "off", "fallback", "status", "none"}
 
 
+def _status_file_fsync_enabled() -> bool:
+    """Return whether fallback status writes should force disk flushes."""
+
+    # The status file is a setup cache; on Windows CI, fsync can stall long
+    # enough to trip CLI timeouts, while os.replace still gives atomic publish.
+    return os.name != "nt"
+
+
 class PhaseLockTimeout(TimeoutError):
-    """Raised when the phase lock cannot be acquired before the timeout."""
+    """Raised when the phase lock cannot be acquired before the timeout.
+
+    ``cause`` is set only when opening the lock sidecar itself failed. A lock
+    primitive reporting contention remains an ordinary timeout, even though
+    its diagnostic message may include the last operating-system error.
+    """
+
+    def __init__(self, message: str, *, cause: OSError | None = None) -> None:
+        super().__init__(message)
+        self.cause = cause
 
 
 class PhaseLockUnavailable(RuntimeError):
     """Raised when this platform has no supported advisory file lock primitive."""
+
+
+class PhaseLockCancelled(RuntimeError):
+    """Raised when a caller cancels an advisory-lock wait."""
 
 
 @dataclass(frozen=True)
@@ -84,11 +105,34 @@ class _XattrProvider:
 
 _DARWIN_XATTR_PROVIDER_UNSET = object()
 _DARWIN_XATTR_PROVIDER: _XattrProvider | None | object = _DARWIN_XATTR_PROVIDER_UNSET
+_DARWIN_XATTR_PROVIDER_LOCK = threading.Lock()
+
+
+def _reset_darwin_xattr_lock_after_fork() -> None:
+    """Give a fork child unlocked process and xattr discovery guards."""
+    global _PROCESS_LOCKS_GUARD, _PROCESS_LOCKS, _DARWIN_XATTR_PROVIDER_LOCK
+
+    # Parent threads cannot release locks inherited by the child.
+    _PROCESS_LOCKS_GUARD = threading.Lock()
+    _PROCESS_LOCKS = {}
+    _DARWIN_XATTR_PROVIDER_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_darwin_xattr_lock_after_fork)
+
+
+# Module-owned selection seams: tests patch these aliases instead of the
+# shared os/sys module attributes, which concurrent threads and other
+# tests can observe. Defaults bind the real values at import.
+_os_getxattr = getattr(os, "getxattr", None)
+_os_setxattr = getattr(os, "setxattr", None)
+_platform = sys.platform
 
 
 def _xattr_provider() -> _XattrProvider | None:
-    getter = getattr(os, "getxattr", None)
-    setter = getattr(os, "setxattr", None)
+    getter = _os_getxattr
+    setter = _os_setxattr
     if callable(getter) and callable(setter):
 
         def get_value(path: Path, key: str) -> bytes:
@@ -114,14 +158,24 @@ def _xattr_env_mode() -> bool | None:
 
 
 def _darwin_xattr_provider() -> _XattrProvider | None:
-    global _DARWIN_XATTR_PROVIDER
-
-    if sys.platform != "darwin":
+    """Return the process-cached Darwin provider after single-flight discovery."""
+    if _platform != "darwin":
         return None
     if _DARWIN_XATTR_PROVIDER is not _DARWIN_XATTR_PROVIDER_UNSET:
         return cast("_XattrProvider | None", _DARWIN_XATTR_PROVIDER)
 
-    try:
+    with _DARWIN_XATTR_PROVIDER_LOCK:
+        if _DARWIN_XATTR_PROVIDER is not _DARWIN_XATTR_PROVIDER_UNSET:
+            return cast("_XattrProvider | None", _DARWIN_XATTR_PROVIDER)
+        return _discover_darwin_xattr_provider()
+
+
+def _discover_darwin_xattr_provider() -> _XattrProvider | None:  # noqa: C901
+    """Discover and cache libc xattr functions while holding the cache lock."""
+    global _DARWIN_XATTR_PROVIDER
+
+    provider: _XattrProvider | None = None
+    with contextlib.suppress(Exception):
         import ctypes
         import ctypes.util
 
@@ -187,13 +241,12 @@ def _darwin_xattr_provider() -> _XattrProvider | None:
             if setxattr(path_bytes, key_bytes, buffer, len(value_bytes), 0, 0) != 0:
                 raise_oserror(path)
 
-        _DARWIN_XATTR_PROVIDER = _XattrProvider(
+        provider = _XattrProvider(
             get_value=get_value,
             set_value=set_value,
         )
-    except Exception:
-        _DARWIN_XATTR_PROVIDER = None
-    return _DARWIN_XATTR_PROVIDER
+    _DARWIN_XATTR_PROVIDER = provider
+    return provider
 
 
 def _validate_phase_name(phase_name: str) -> None:
@@ -250,10 +303,18 @@ class PhaseRunResult:
 class _AdvisoryLock:
     """Cross-platform non-blocking advisory lock wrapper."""
 
-    def __init__(self, path: Path, *, timeout: float, retry_delay: float) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        timeout: float,
+        retry_delay: float,
+        create_parent: bool = True,
+    ) -> None:
         self.path = path
         self.timeout = timeout
         self.retry_delay = retry_delay
+        self.create_parent = create_parent
         self._file: BinaryIO | None = None
         self._locked = False
         self._process_lock: threading.RLock | None = None
@@ -265,71 +326,94 @@ class _AdvisoryLock:
         should_stop_waiting: Callable[[], bool] | None = None,
         diagnostics: Callable[[], str] | None = None,
     ) -> bool:
+        if self._locked:
+            raise RuntimeError(
+                "AdvisoryFileLock does not support re-entrant acquisition. "
+                "Create a new lock instance or release before re-acquiring."
+            )
+
         if fcntl is None and msvcrt is None:
             raise PhaseLockUnavailable(
                 "No supported advisory file lock primitive is available"
             )
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.create_parent:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         start = time.monotonic()
-        last_error: OSError | None = None
-        if not self._acquire_process_lock(
-            start,
-            should_stop_waiting=should_stop_waiting,
-            diagnostics=diagnostics,
-        ):
+        try:
+            process_locked = self._acquire_process_lock(
+                start,
+                should_stop_waiting=should_stop_waiting,
+                diagnostics=diagnostics,
+            )
+            while process_locked:
+                if should_stop_waiting is not None and should_stop_waiting():
+                    return False
+
+                try:
+                    lock_file = self.path.open("a+b")
+                except OSError as exc:
+                    if not self._wait_to_retry(
+                        start,
+                        last_error=exc,
+                        cause=exc,
+                        should_stop_waiting=should_stop_waiting,
+                        diagnostics=diagnostics,
+                    ):
+                        return False
+                    continue
+
+                # Own the descriptor before preparation can raise. Only a
+                # successful acquisition transfers it to the release caller.
+                self._file = lock_file
+                try:
+                    self._prepare_lock_file(lock_file)
+                    self._try_lock(lock_file)
+                except OSError as exc:
+                    lock_file.close()
+                    self._file = None
+                    if not self._wait_to_retry(
+                        start,
+                        last_error=exc,
+                        cause=None,
+                        should_stop_waiting=should_stop_waiting,
+                        diagnostics=diagnostics,
+                    ):
+                        return False
+                    continue
+
+                self._locked = True
+                return True
             return False
+        finally:
+            if not self._locked:
+                self.release()
 
-        while True:
-            if should_stop_waiting is not None and should_stop_waiting():
-                self._release_process_lock()
-                return False
-
-            try:
-                lock_file = self.path.open("a+b")
-            except OSError as exc:
-                last_error = exc
-                if should_stop_waiting is not None and should_stop_waiting():
-                    self._release_process_lock()
-                    return False
-                if time.monotonic() - start >= self.timeout:
-                    self._release_process_lock()
-                    raise PhaseLockTimeout(
-                        self._timeout_message(
-                            start,
-                            last_error=last_error,
-                            diagnostics=diagnostics,
-                        )
-                    ) from None
-                time.sleep(self.retry_delay)
-                continue
-
-            try:
-                with contextlib.suppress(OSError):
-                    os.chmod(self.path, 0o600)
-                self._prepare_lock_file(lock_file)
-                self._try_lock(lock_file)
-            except OSError as exc:
-                last_error = exc
-                lock_file.close()
-                if should_stop_waiting is not None and should_stop_waiting():
-                    self._release_process_lock()
-                    return False
-                if time.monotonic() - start >= self.timeout:
-                    self._release_process_lock()
-                    raise PhaseLockTimeout(
-                        self._timeout_message(
-                            start,
-                            last_error=last_error,
-                            diagnostics=diagnostics,
-                        )
-                    ) from None
-                time.sleep(self.retry_delay)
-                continue
-
-            self._file = lock_file
-            self._locked = True
-            return True
+    def _wait_to_retry(
+        self,
+        start: float,
+        *,
+        last_error: OSError,
+        cause: OSError | None,
+        should_stop_waiting: Callable[[], bool] | None,
+        diagnostics: Callable[[], str] | None,
+    ) -> bool:
+        """Wait for another lock attempt or finish the current acquisition."""
+        if should_stop_waiting is not None and should_stop_waiting():
+            self._release_process_lock()
+            return False
+        if time.monotonic() - start >= self.timeout:
+            self._release_process_lock()
+            raise PhaseLockTimeout(
+                self._timeout_message(
+                    start,
+                    last_error=last_error,
+                    diagnostics=diagnostics,
+                ),
+                cause=cause,
+            ) from None
+        time.sleep(self.retry_delay)
+        return True
 
     def _prepare_lock_file(self, lock_file: BinaryIO) -> None:
         """Ensure byte-range locking has at least one byte to lock."""
@@ -459,7 +543,7 @@ class AdvisoryFileLock(_AdvisoryLock):
 
         return self._locked
 
-    def __enter__(self) -> AdvisoryFileLock:
+    def __enter__(self) -> AdvisoryFileLock:  # noqa: PYI034
         self.acquire()
         return self
 
@@ -489,8 +573,12 @@ class PhaseLockService:
     ) -> None:
         self.target = Path(target)
         self.namespace = namespace.strip(".")
-        self.lock_path = self.target.with_suffix(lock_suffix)
-        self.status_base_path = self.target.with_suffix(status_suffix)
+        # Append to the full target name (never with_suffix): with_suffix
+        # collapses same-stem targets (mydb.db, mydb.backup) onto one sidecar,
+        # so mydb.db -> mydb.db.lock and mydb.backup -> mydb.backup.lock stay
+        # distinct.
+        self.lock_path = Path(str(self.target) + lock_suffix)
+        self.status_base_path = Path(str(self.target) + status_suffix)
         self.timeout = timeout
         self.retry_delay = retry_delay
         self._use_xattrs = use_xattrs
@@ -548,6 +636,16 @@ class PhaseLockService:
         key = self.attr_key(phase_name, attr_name)
         return self._set_xattr(key, value)
 
+    def get_xattr_value(
+        self,
+        phase_name: str,
+        *,
+        attr_name: str | None = None,
+    ) -> bytes | None:
+        """Return one xattr value, or ``None`` when it is absent/unavailable."""
+
+        return self._get_xattr(self.attr_key(phase_name, attr_name))
+
     @contextlib.contextmanager
     def locked(self) -> Iterator[None]:
         """Hold the advisory setup lock."""
@@ -563,7 +661,14 @@ class PhaseLockService:
         finally:
             lock.release()
 
-    def run_phases(self, phases: Iterable[Phase]) -> PhaseRunResult:
+    def run_phases(  # noqa: C901
+        self,
+        phases: Iterable[Phase],
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+        discard_status_if: Callable[[], bool] | None = None,
+        completion_is_valid: Callable[[bool], bool] | None = None,
+    ) -> PhaseRunResult:
         """Run missing phases in order under the setup lock.
 
         On Windows, the lock is always acquired before completion markers are
@@ -574,6 +679,16 @@ class PhaseLockService:
         On POSIX, markers remain completion hints that can bypass lock
         acquisition. POSIX file-handle semantics do not need the Windows barrier,
         and preserving the fast path avoids changing non-Windows setup behavior.
+
+        When ``discard_status_if`` is provided, its fallback-status decision is
+        evaluated only after lock acquisition. A true result invalidates the
+        existing fallback entries even when best-effort unlink cannot remove the
+        stale file. Fallback publication replaces it atomically; xattr mode first
+        replaces any surviving stable status file with an empty one.
+
+        ``completion_is_valid`` lets a caller treat an existing marker as a
+        cache hint. Its argument is false before locking and true under the
+        lock, where a false result reruns the marked phase before republishing.
         """
 
         phase_list = tuple(phases)
@@ -587,8 +702,11 @@ class PhaseLockService:
             )
 
         using_xattrs = self._should_use_xattrs()
-        if not self.strict_marker_locking and self._all_marked(
-            phase_list, using_xattrs=using_xattrs
+        if (
+            discard_status_if is None
+            and not self.strict_marker_locking
+            and self._all_marked(phase_list, using_xattrs=using_xattrs)
+            and (completion_is_valid is None or completion_is_valid(False))
         ):
             return PhaseRunResult(
                 completed=(),
@@ -600,6 +718,30 @@ class PhaseLockService:
 
         completed: list[str] = []
         skipped: list[str] = []
+
+        def cancellation_requested() -> bool:
+            if should_cancel is None:
+                return False
+            cancelled = False
+            # Cancellation is a best-effort hint. A broken callback must not
+            # strand a setup lock or prevent the phase from making progress.
+            with contextlib.suppress(Exception):
+                cancelled = bool(should_cancel())
+            return cancelled
+
+        def should_stop_lock_wait() -> bool:
+            if cancellation_requested():
+                return True
+            if discard_status_if is not None or self.strict_marker_locking:
+                return False
+            marked = self._all_marked(
+                phase_list,
+                using_xattrs=self._should_use_xattrs(),
+            )
+            return marked and (
+                completion_is_valid is None or completion_is_valid(False)
+            )
+
         lock = _AdvisoryLock(
             self.lock_path,
             timeout=self.timeout,
@@ -607,15 +749,17 @@ class PhaseLockService:
         )
         acquired = lock.acquire(
             should_stop_waiting=(
-                None
-                if self.strict_marker_locking
-                else lambda: self._all_marked(
-                    phase_list, using_xattrs=self._should_use_xattrs()
-                )
+                should_stop_lock_wait
+                if should_cancel is not None or not self.strict_marker_locking
+                else None
             ),
             diagnostics=lambda: self._phase_diagnostics(phase_list),
         )
         if not acquired:
+            if cancellation_requested():
+                raise PhaseLockCancelled(
+                    f"Cancelled while waiting for phase lock: {self.lock_path}"
+                )
             using_xattrs = self._should_use_xattrs()
             return PhaseRunResult(
                 completed=(),
@@ -626,11 +770,38 @@ class PhaseLockService:
             )
 
         try:
+            if cancellation_requested():
+                raise PhaseLockCancelled(
+                    f"Cancelled while waiting for phase lock: {self.lock_path}"
+                )
             using_xattrs = self._should_use_xattrs()
+            discard_required = bool(
+                discard_status_if is not None and discard_status_if()
+            )
+            if discard_required:
+                self.discard_status_markers()
+                if using_xattrs and self.status_base_path.exists():
+                    self._write_status_phases([])
+            rerun_marked = bool(
+                completion_is_valid is not None
+                and self._all_marked(phase_list, using_xattrs=using_xattrs)
+                and not completion_is_valid(True)
+            )
             if using_xattrs:
-                self._run_xattr_phases(phase_list, completed, skipped)
+                self._run_xattr_phases(
+                    phase_list,
+                    completed,
+                    skipped,
+                    rerun_marked=rerun_marked,
+                )
             else:
-                self._run_status_phases(phase_list, completed, skipped)
+                self._run_status_phases(
+                    phase_list,
+                    completed,
+                    skipped,
+                    ignore_existing=discard_required,
+                    rerun_marked=rerun_marked,
+                )
         finally:
             lock.release()
 
@@ -649,9 +820,13 @@ class PhaseLockService:
         phases: tuple[Phase, ...],
         completed: list[str],
         skipped: list[str],
+        *,
+        rerun_marked: bool = False,
     ) -> None:
         for phase in phases:
-            if self._has_xattr_phase(phase.name, attr_name=phase.attr_name):
+            if not rerun_marked and self._has_xattr_phase(
+                phase.name, attr_name=phase.attr_name
+            ):
                 skipped.append(phase.name)
                 continue
             phase.action()
@@ -669,17 +844,23 @@ class PhaseLockService:
         phases: tuple[Phase, ...],
         completed: list[str],
         skipped: list[str],
+        *,
+        ignore_existing: bool = False,
+        rerun_marked: bool = False,
     ) -> None:
-        status_order, _diagnostic = self._read_status_entries()
+        status_order, _diagnostic = (
+            ([], None) if ignore_existing else self._read_status_entries()
+        )
         status_phases = set(status_order)
         for phase in phases:
             _validate_phase_name(phase.name)
-            if phase.name in status_phases:
+            if phase.name in status_phases and not rerun_marked:
                 skipped.append(phase.name)
                 continue
             phase.action()
-            status_phases.add(phase.name)
-            status_order.append(phase.name)
+            if phase.name not in status_phases:
+                status_phases.add(phase.name)
+                status_order.append(phase.name)
             self._write_status_phases(status_order)
             completed.append(phase.name)
 
@@ -845,15 +1026,17 @@ class PhaseLockService:
             flags |= os.O_BINARY
         fd: int | None = None
         try:
-            fd = os.open(tmp_path, flags, 0o600)
+            fd = os.open(tmp_path, flags, 0o666)
             with os.fdopen(fd, "wb") as status_file:
                 fd = None
                 status_file.write(data)
                 status_file.flush()
-                with contextlib.suppress(OSError):
-                    os.fsync(status_file.fileno())
+                if _status_file_fsync_enabled():
+                    with contextlib.suppress(OSError):
+                        os.fsync(status_file.fileno())
             os.replace(tmp_path, self.status_base_path)
-            self._fsync_parent_directory()
+            if _status_file_fsync_enabled():
+                self._fsync_parent_directory()
         except Exception:
             if fd is not None:
                 with contextlib.suppress(OSError):
@@ -878,6 +1061,10 @@ class PhaseLockService:
         Use this only when the target itself is known to be stale or absent.
         Advisory lock files are deliberately left alone because existence is not
         ownership, and another thread or process may currently hold the lock.
+        Explicit destructive global ``--cleanup`` is the sole exception to the
+        ordinary lifecycle rule. If it overlaps phaselock/status activity,
+        deletion and recreation can split coordination across file generations;
+        That overlap is undefined.
         """
 
         for path in self._status_paths():
@@ -913,9 +1100,10 @@ class PhaseLockService:
 
 
 __all__ = [
-    "AdvisoryFileLock",
     "PHASELOCK_ENABLE_XATTRS",
+    "AdvisoryFileLock",
     "Phase",
+    "PhaseLockCancelled",
     "PhaseLockService",
     "PhaseLockTimeout",
     "PhaseLockUnavailable",

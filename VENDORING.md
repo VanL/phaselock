@@ -28,6 +28,7 @@ The stable public API is:
 - `AdvisoryFileLock`
 - `PHASELOCK_ENABLE_XATTRS`
 - `Phase`
+- `PhaseLockCancelled`
 - `PhaseLockService`
 - `PhaseLockTimeout`
 - `PhaseLockUnavailable`

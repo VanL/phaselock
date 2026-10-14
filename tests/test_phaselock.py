@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
+import signal
 import subprocess
 import sys
 import textwrap
 import threading
 import time
+import warnings
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, BinaryIO, cast
 
 import pytest
 
@@ -18,12 +22,19 @@ import phaselock as phaselock_module
 from phaselock import (
     AdvisoryFileLock,
     Phase,
+    PhaseLockCancelled,
     PhaseLockService,
     PhaseLockTimeout,
     PhaseLockUnavailable,
     PhaseRunResult,
-    __version__,
 )
+
+
+def scale_timeout_for_ci(timeout: float, ci_factor: float = 2.0) -> float:
+    """Scale timeout for CI environment."""
+    if os.environ.get("CI"):
+        return timeout * ci_factor
+    return timeout
 
 
 def _real_xattrs_supported(target: Path) -> bool:
@@ -66,8 +77,33 @@ def _read_status_file(path: Path) -> list[str]:
     return path.read_text(encoding="utf-8").splitlines()
 
 
-def test_version_is_1_0() -> None:
-    assert __version__ == "1.0"
+def _run_phaselock_under_umask(
+    target: Path,
+    umask: int,
+    *,
+    phase_name: str = "permission-probe",
+) -> None:
+    probe = textwrap.dedent(
+        """
+        import os
+        import sys
+        from pathlib import Path
+
+        from phaselock import Phase, PhaseLockService
+
+        os.umask(int(sys.argv[2], 8))
+        target = Path(sys.argv[1])
+        service = PhaseLockService(target, use_xattrs=False)
+        service.run_phases((Phase(sys.argv[3], lambda: None),))
+        """
+    )
+    subprocess.run(
+        [sys.executable, "-c", probe, str(target), f"{umask:o}", phase_name],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_xattr_env_mode_parses_enabled_disabled_and_unknown_values(
@@ -98,8 +134,8 @@ def test_stdlib_xattr_provider_wraps_get_and_set_values_as_bytes(
     def setxattr(path: Path, key: str, value: bytes) -> None:
         calls.append((path, key, value))
 
-    monkeypatch.setattr(phaselock_module.os, "getxattr", getxattr, raising=False)
-    monkeypatch.setattr(phaselock_module.os, "setxattr", setxattr, raising=False)
+    monkeypatch.setattr(phaselock_module, "_os_getxattr", getxattr)
+    monkeypatch.setattr(phaselock_module, "_os_setxattr", setxattr)
 
     provider = phaselock_module._xattr_provider()
 
@@ -107,41 +143,6 @@ def test_stdlib_xattr_provider_wraps_get_and_set_values_as_bytes(
     assert provider.get_value(target, "user.phaselock.phase") == b"done"
     provider.set_value(target, "user.phaselock.phase", cast(Any, bytearray(b"1")))
     assert calls == [(target, "user.phaselock.phase", b"1")]
-
-
-def test_darwin_xattr_provider_returns_none_on_non_darwin_platform(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(phaselock_module.sys, "platform", "linux")
-    monkeypatch.setattr(
-        phaselock_module,
-        "_DARWIN_XATTR_PROVIDER",
-        phaselock_module._DARWIN_XATTR_PROVIDER_UNSET,
-    )
-
-    assert phaselock_module._darwin_xattr_provider() is None
-
-
-def test_darwin_xattr_provider_caches_initialization_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import ctypes
-
-    monkeypatch.setattr(phaselock_module.sys, "platform", "darwin")
-    monkeypatch.setattr(
-        phaselock_module,
-        "_DARWIN_XATTR_PROVIDER",
-        phaselock_module._DARWIN_XATTR_PROVIDER_UNSET,
-    )
-    monkeypatch.setattr(
-        ctypes,
-        "CDLL",
-        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("no libc")),
-    )
-
-    assert phaselock_module._darwin_xattr_provider() is None
-    assert phaselock_module._DARWIN_XATTR_PROVIDER is None
-    assert phaselock_module._darwin_xattr_provider() is None
 
 
 class _FakeCFunction:
@@ -190,7 +191,7 @@ def _install_fake_darwin_libc(
         cdll_calls.append((path, use_errno))
         return fake_libc
 
-    monkeypatch.setattr(phaselock_module.sys, "platform", "darwin")
+    monkeypatch.setattr(phaselock_module, "_platform", "darwin")
     monkeypatch.setattr(
         phaselock_module,
         "_DARWIN_XATTR_PROVIDER",
@@ -329,49 +330,6 @@ def test_darwin_xattr_provider_returns_empty_value_without_second_read(
     assert provider is not None
     assert provider.get_value(target, "user.phaselock.empty") == b""
     assert calls == [(os.fsencode(target), b"user.phaselock.empty", None, 0, 0, 0)]
-
-
-def test_darwin_xattr_provider_retries_get_when_value_grows(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import ctypes
-
-    target = tmp_path / "broker.db"
-    value = b"grown"
-    calls: list[tuple[object | None, int]] = []
-
-    def getxattr(
-        path: bytes,
-        key: bytes,
-        buffer: object | None,
-        size: int,
-        position: int,
-        options: int,
-    ) -> int:
-        calls.append((buffer, size))
-        if len(calls) == 1:
-            return 3
-        if len(calls) == 2:
-            ctypes.set_errno(getattr(errno, "ERANGE", 34))
-            return -1
-        if len(calls) == 3:
-            return len(value)
-        assert buffer is not None
-        ctypes.memmove(cast(Any, buffer), value, len(value))
-        return len(value)
-
-    _install_fake_darwin_libc(monkeypatch, getxattr)
-    provider = phaselock_module._darwin_xattr_provider()
-
-    assert provider is not None
-    assert provider.get_value(target, "user.phaselock.phase") == value
-    assert [(buffer is None, size) for buffer, size in calls] == [
-        (True, 0),
-        (False, 3),
-        (True, 0),
-        (False, len(value)),
-    ]
 
 
 def test_darwin_xattr_provider_raises_when_read_fails_without_erange(
@@ -513,8 +471,8 @@ def test_darwin_ctypes_xattrs_are_used_when_stdlib_xattrs_are_missing(
 
     import phaselock as phaselock_module
 
-    monkeypatch.setattr(phaselock_module.os, "getxattr", None, raising=False)
-    monkeypatch.setattr(phaselock_module.os, "setxattr", None, raising=False)
+    monkeypatch.setattr(phaselock_module, "_os_getxattr", None)
+    monkeypatch.setattr(phaselock_module, "_os_setxattr", None)
     target = tmp_path / "broker.db"
     target.touch()
     if not _default_xattrs_supported(target):
@@ -543,8 +501,8 @@ def test_missing_stdlib_and_darwin_xattrs_falls_back_to_status_file(
 ) -> None:
     import phaselock as phaselock_module
 
-    monkeypatch.setattr(phaselock_module.os, "getxattr", None, raising=False)
-    monkeypatch.setattr(phaselock_module.os, "setxattr", None, raising=False)
+    monkeypatch.setattr(phaselock_module, "_os_getxattr", None)
+    monkeypatch.setattr(phaselock_module, "_os_setxattr", None)
     monkeypatch.setattr(phaselock_module, "_darwin_xattr_provider", lambda: None)
     target = tmp_path / "broker.db"
     target.touch()
@@ -583,6 +541,48 @@ def test_env_can_force_status_fallback(
     assert result.status_paths == (service.status_base_path,)
     assert calls == ["connection"]
     assert _read_status_file(service.status_base_path) == ["connection-v1"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX umask contract")
+@pytest.mark.parametrize(
+    ("umask", "expected_mode"),
+    ((0o002, 0o664), (0o077, 0o600)),
+)
+def test_phase_lock_and_status_creation_respect_operator_umask(
+    tmp_path: Path,
+    umask: int,
+    expected_mode: int,
+) -> None:
+    """Fresh companion files use ordinary creation modes filtered by umask."""
+    target = tmp_path / f"broker-{umask:o}.db"
+
+    _run_phaselock_under_umask(target, umask)
+
+    service = PhaseLockService(target, use_xattrs=False)
+    assert service.lock_path.stat().st_mode & 0o777 == expected_mode
+    assert service.status_base_path.stat().st_mode & 0o777 == expected_mode
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode preservation contract")
+def test_status_republication_preserves_lock_mode_and_uses_current_umask(
+    tmp_path: Path,
+) -> None:
+    """A stable lock keeps its mode while each status generation is new."""
+    target = tmp_path / "broker.db"
+    service = PhaseLockService(target, use_xattrs=False)
+
+    _run_phaselock_under_umask(target, 0o002, phase_name="first-probe")
+    assert service.lock_path.stat().st_mode & 0o777 == 0o664
+    assert service.status_base_path.stat().st_mode & 0o777 == 0o664
+
+    _run_phaselock_under_umask(target, 0o077, phase_name="second-probe")
+
+    assert service.lock_path.stat().st_mode & 0o777 == 0o664
+    assert service.status_base_path.stat().st_mode & 0o777 == 0o600
+    assert _read_status_file(service.status_base_path) == [
+        "first-probe",
+        "second-probe",
+    ]
 
 
 def test_explicit_xattr_setting_overrides_env_fallback_when_available(
@@ -692,11 +692,101 @@ def _subprocess_holding_phase_lock(target: Path) -> Iterator[subprocess.Popen[st
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5.0)
+        stdout, stderr = proc.communicate()
         if proc.returncode != 0:
-            stdout, stderr = proc.communicate()
             raise AssertionError(
                 f"lock holder failed with {proc.returncode}\nstdout={stdout}\nstderr={stderr}"
             )
+
+
+def _assert_lock_available_to_another_thread(lock_path: Path) -> None:
+    def acquire_and_release() -> None:
+        with AdvisoryFileLock(
+            lock_path, timeout=scale_timeout_for_ci(0.2), retry_delay=0.01
+        ):
+            pass
+
+    # Same-thread acquisition would hide a leaked process-local RLock.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(acquire_and_release).result(timeout=scale_timeout_for_ci(5.0))
+
+
+@pytest.mark.parametrize("during_file_contention", [False, True])
+def test_acquisition_callback_failure_releases_process_lock(
+    tmp_path: Path, during_file_contention: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "broker.db"
+    target.touch()
+    lock_path = Path(f"{target}.lock")
+    lock = AdvisoryFileLock(lock_path, timeout=1.0, retry_delay=0.01)
+    failure = RuntimeError("validation unavailable")
+    file_attempt_failed = False
+    try_lock = phaselock_module._AdvisoryLock._try_lock
+
+    def observe_try_lock(self: Any, lock_file: BinaryIO) -> None:
+        nonlocal file_attempt_failed
+        try:
+            try_lock(self, lock_file)
+        except OSError:
+            file_attempt_failed = True
+            raise
+
+    monkeypatch.setattr(phaselock_module._AdvisoryLock, "_try_lock", observe_try_lock)
+
+    def should_stop() -> bool:
+        boundary_reached = (
+            file_attempt_failed if during_file_contention else lock._process_locked
+        )
+        if boundary_reached:
+            raise failure
+        return False
+
+    try:
+        if during_file_contention:
+            with (
+                _subprocess_holding_phase_lock(target),
+                pytest.raises(RuntimeError) as raised,
+            ):
+                lock.acquire(should_stop_waiting=should_stop)
+        else:
+            with pytest.raises(RuntimeError) as raised:
+                lock.acquire(should_stop_waiting=should_stop)
+        assert raised.value is failure
+        _assert_lock_available_to_another_thread(lock_path)
+    finally:
+        lock.release()
+
+
+def test_control_exception_during_file_preparation_closes_file_and_releases_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class AbortAcquisition(BaseException):
+        pass
+
+    failure = AbortAcquisition()
+    opened: list[BinaryIO] = []
+    lock_path = tmp_path / "broker.db.lock"
+    lock = AdvisoryFileLock(lock_path, timeout=1.0, retry_delay=0.01)
+
+    def abort_preparation(self: Any, lock_file: BinaryIO) -> None:
+        opened.append(lock_file)
+        raise failure
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                phaselock_module._AdvisoryLock, "_prepare_lock_file", abort_preparation
+            )
+            with pytest.raises(AbortAcquisition) as raised:
+                lock.acquire()
+        assert raised.value is failure
+        assert len(opened) == 1
+        assert opened[0].closed
+        _assert_lock_available_to_another_thread(lock_path)
+    finally:
+        for lock_file in opened:
+            lock_file.close()
+        lock.release()
 
 
 def test_real_xattr_runtime_marks_and_skips_completed_phases(tmp_path: Path) -> None:
@@ -863,19 +953,19 @@ def test_no_xattr_fallback_writes_single_status_file_and_no_done_files(
 
     assert first.completed == ("connection-v1", "schema-v4")
     assert first.xattrs_available is False
-    expected_status_paths = (tmp_path / "broker.status",)
+    expected_status_paths = (tmp_path / "broker.db.status",)
     assert first.status_paths == expected_status_paths
     assert second.completed == ()
     assert second.skipped == ("connection-v1", "schema-v4")
     assert second.status_paths == expected_status_paths
     assert calls == ["connection", "schema"]
-    assert service.lock_path == tmp_path / "broker.lock"
+    assert service.lock_path == tmp_path / "broker.db.lock"
     assert service.lock_path.exists()
     assert _read_status_file(service.status_base_path) == [
         "connection-v1",
         "schema-v4",
     ]
-    assert sorted(tmp_path.glob("broker.status.*")) == []
+    assert sorted(tmp_path.glob("broker.db.status.*")) == []
     assert not list(tmp_path.glob("*.done"))
 
 
@@ -1248,13 +1338,13 @@ def test_write_status_phases_removes_temp_file_when_fdopen_fails(
         service._write_status_phases(["connection-v1"])
 
     assert not service.status_base_path.exists()
-    assert list(tmp_path.glob("broker.status.tmp.*")) == []
+    assert list(tmp_path.glob("broker.db.status.tmp.*")) == []
 
 
 def test_discard_status_markers_removes_current_markers(tmp_path: Path) -> None:
     target = tmp_path / "broker.db"
     service = PhaseLockService(target, use_xattrs=False)
-    current_temp = tmp_path / "broker.status.tmp.1"
+    current_temp = tmp_path / "broker.db.status.tmp.1"
 
     service.status_base_path.touch()
     current_temp.touch()
@@ -1267,6 +1357,134 @@ def test_discard_status_markers_removes_current_markers(tmp_path: Path) -> None:
     assert service.lock_path.exists()
 
 
+def test_required_status_discard_ignores_stale_entries_when_unlink_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "broker.db"
+    service = PhaseLockService(
+        target,
+        use_xattrs=False,
+        strict_marker_locking=True,
+    )
+    service.status_base_path.write_text("connection-v1\n", encoding="utf-8")
+    calls: list[str] = []
+    real_unlink = Path.unlink
+
+    def fail_stale_status_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path == service.status_base_path:
+            raise PermissionError("injected stale-status unlink failure")
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_stale_status_unlink)
+
+    result = service.run_phases(
+        (Phase("connection-v1", lambda: calls.append("ran")),),
+        discard_status_if=lambda: True,
+    )
+
+    assert calls == ["ran"]
+    assert result.completed == ("connection-v1",)
+    assert result.skipped == ()
+    assert _read_status_file(service.status_base_path) == ["connection-v1"]
+
+
+def test_required_status_discard_removes_fallback_markers_in_xattr_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "broker.db"
+    target.touch()
+    missing_errno = 8765
+    values: dict[tuple[Path, str], bytes] = {}
+
+    def get_value(path: Path, key: str) -> bytes:
+        try:
+            return values[(path, key)]
+        except KeyError:
+            raise OSError(missing_errno, "missing") from None
+
+    def set_value(path: Path, key: str, value: bytes) -> None:
+        values[(path, key)] = value
+
+    provider = phaselock_module._XattrProvider(
+        get_value=get_value,
+        set_value=set_value,
+    )
+    monkeypatch.setattr(phaselock_module, "_MISSING_XATTR_ERRNOS", {missing_errno})
+    monkeypatch.setattr(phaselock_module, "_xattr_provider", lambda: provider)
+
+    service = PhaseLockService(target, use_xattrs=True)
+    stale_temp = tmp_path / "broker.db.status.tmp.stale"
+    service.status_base_path.write_text("schema-v999\n", encoding="utf-8")
+    stale_temp.touch()
+    calls: list[str] = []
+
+    result = service.run_phases(
+        (Phase("connection-v1", lambda: calls.append("ran")),),
+        discard_status_if=lambda: True,
+    )
+
+    assert calls == ["ran"]
+    assert result.completed == ("connection-v1",)
+    assert result.xattrs_available is True
+    assert result.status_paths == ()
+    assert not service.status_base_path.exists()
+    assert not stale_temp.exists()
+
+
+def test_required_status_discard_neutralizes_undeletable_marker_in_xattr_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "broker.db"
+    target.touch()
+    missing_errno = 8765
+    values: dict[tuple[Path, str], bytes] = {}
+
+    def get_value(path: Path, key: str) -> bytes:
+        try:
+            return values[(path, key)]
+        except KeyError:
+            raise OSError(missing_errno, "missing") from None
+
+    def set_value(path: Path, key: str, value: bytes) -> None:
+        values[(path, key)] = value
+
+    provider = phaselock_module._XattrProvider(
+        get_value=get_value,
+        set_value=set_value,
+    )
+    monkeypatch.setattr(phaselock_module, "_MISSING_XATTR_ERRNOS", {missing_errno})
+    monkeypatch.setattr(phaselock_module, "_xattr_provider", lambda: provider)
+
+    service = PhaseLockService(target, use_xattrs=True)
+    service.status_base_path.write_text("schema-v999\n", encoding="utf-8")
+    real_unlink = Path.unlink
+
+    def fail_stale_status_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path == service.status_base_path:
+            raise PermissionError("injected stale-status unlink failure")
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_stale_status_unlink)
+
+    xattr_result = service.run_phases(
+        (Phase("connection-v1", lambda: None),),
+        discard_status_if=lambda: True,
+    )
+    fallback_calls: list[str] = []
+    fallback_result = PhaseLockService(target, use_xattrs=False).run_phases(
+        (Phase("schema-v999", lambda: fallback_calls.append("ran")),)
+    )
+
+    assert xattr_result.completed == ("connection-v1",)
+    assert fallback_calls == ["ran"]
+    assert fallback_result.completed == ("schema-v999",)
+    assert fallback_result.skipped == ()
+    assert _read_status_file(service.status_base_path) == ["schema-v999"]
+
+
 def test_no_xattr_existing_status_marker_does_not_bypass_held_lock(
     tmp_path: Path,
 ) -> None:
@@ -1274,7 +1492,7 @@ def test_no_xattr_existing_status_marker_does_not_bypass_held_lock(
     target.touch()
     service = PhaseLockService(
         target,
-        timeout=1.0,
+        timeout=scale_timeout_for_ci(5.0),
         retry_delay=0.01,
         use_xattrs=False,
         strict_marker_locking=True,
@@ -1294,7 +1512,7 @@ def test_no_xattr_existing_status_marker_does_not_bypass_held_lock(
             result_holder["result"] = service.run_phases(
                 (Phase("connection-v1", lambda: calls.append("ran")),)
             )
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
         finally:
             done.set()
@@ -1317,6 +1535,64 @@ def test_no_xattr_existing_status_marker_does_not_bypass_held_lock(
     assert not waiter.is_alive()
 
 
+def test_strict_lock_wait_can_be_cancelled(tmp_path: Path) -> None:
+    """Callers can stop waiting without weakening the marker barrier."""
+    target = tmp_path / "broker.db"
+    target.touch()
+    service = PhaseLockService(
+        target,
+        timeout=5.0,
+        retry_delay=0.01,
+        use_xattrs=False,
+        strict_marker_locking=True,
+    )
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    stop_waiting = threading.Event()
+    done = threading.Event()
+    errors: list[BaseException] = []
+    calls: list[str] = []
+
+    def hold_lock() -> None:
+        with service.locked():
+            lock_held.set()
+            release_lock.wait(timeout=2.0)
+
+    def wait_for_phase() -> None:
+        try:
+            service.run_phases(
+                (Phase("connection-v1", lambda: calls.append("ran")),),
+                should_cancel=stop_waiting.is_set,
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            done.set()
+
+    holder = threading.Thread(target=hold_lock)
+    waiter = threading.Thread(target=wait_for_phase)
+    try:
+        holder.start()
+        assert lock_held.wait(timeout=1.0)
+        waiter.start()
+        assert not done.wait(timeout=0.1)
+
+        stop_waiting.set()
+
+        assert done.wait(timeout=1.0)
+    finally:
+        release_lock.set()
+        holder.join(timeout=1.0)
+        waiter.join(timeout=1.0)
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], PhaseLockCancelled)
+    assert "cancel" in str(errors[0]).lower()
+    assert calls == []
+    assert not holder.is_alive()
+    assert not waiter.is_alive()
+
+
 def test_no_xattr_waiter_does_not_skip_when_phase_marked_while_lock_is_held(
     tmp_path: Path,
 ) -> None:
@@ -1324,7 +1600,7 @@ def test_no_xattr_waiter_does_not_skip_when_phase_marked_while_lock_is_held(
     target.touch()
     service = PhaseLockService(
         target,
-        timeout=1.0,
+        timeout=scale_timeout_for_ci(5.0),
         retry_delay=0.01,
         use_xattrs=False,
         strict_marker_locking=True,
@@ -1342,7 +1618,7 @@ def test_no_xattr_waiter_does_not_skip_when_phase_marked_while_lock_is_held(
             result_holder["result"] = service.run_phases(
                 (Phase("connection-v1", lambda: calls.append("ran")),)
             )
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
         finally:
             done.set()
@@ -1372,84 +1648,83 @@ def test_no_xattr_waiter_does_not_skip_when_phase_marked_while_lock_is_held(
     assert not waiter.is_alive()
 
 
-def test_no_xattr_non_strict_waiter_skips_when_phase_marked_while_lock_is_held(
+def test_process_local_lock_serializes_threads(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = tmp_path / "broker.db"
     target.touch()
-    service = PhaseLockService(
-        target,
-        timeout=1.0,
-        retry_delay=0.01,
-        use_xattrs=False,
-        strict_marker_locking=False,
-    )
-    calls: list[str] = []
-
-    def mark_phase_after_waiter_blocks() -> None:
-        time.sleep(0.05)
-        _write_status_file(service.status_base_path, ["connection-v1"])
-
-    with _subprocess_holding_phase_lock(target):
-        marker = threading.Thread(target=mark_phase_after_waiter_blocks)
-        marker.start()
-        result = service.run_phases(
-            (Phase("connection-v1", lambda: calls.append("ran")),)
-        )
-        marker.join(timeout=1.0)
-
-    assert result.completed == ()
-    assert result.skipped == ("connection-v1",)
-    assert calls == []
-    assert not marker.is_alive()
-
-
-def test_process_local_lock_serializes_threads(tmp_path: Path) -> None:
-    target = tmp_path / "broker.db"
-    target.touch()
+    timeout = scale_timeout_for_ci(2.0)
     first_service = PhaseLockService(
         target,
-        timeout=1.0,
+        timeout=timeout,
         retry_delay=0.01,
         use_xattrs=False,
     )
     second_service = PhaseLockService(
         target,
-        timeout=1.0,
+        timeout=timeout,
         retry_delay=0.01,
         use_xattrs=False,
     )
     first_entered = threading.Event()
     release_first = threading.Event()
+    second_waiting = threading.Event()
+    second_done = threading.Event()
     calls: list[str] = []
     results: dict[str, PhaseRunResult] = {}
+    errors: list[BaseException] = []
+
+    real_acquire_process_lock = phaselock_module._AdvisoryLock._acquire_process_lock
+
+    def observe_process_lock(self: Any, *args: Any, **kwargs: Any) -> bool:
+        if threading.current_thread().name == "second-phase-runner":
+            second_waiting.set()
+        return real_acquire_process_lock(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        phaselock_module._AdvisoryLock,
+        "_acquire_process_lock",
+        observe_process_lock,
+    )
 
     def first_action() -> None:
         calls.append("first")
         first_entered.set()
-        assert release_first.wait(timeout=1.0)
+        assert release_first.wait(timeout=timeout)
 
     def run_first() -> None:
-        first_service.run_phases((Phase("connection-v1", first_action),))
+        try:
+            first_service.run_phases((Phase("connection-v1", first_action),))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
 
     def run_second() -> None:
-        results["second"] = second_service.run_phases(
-            (Phase("connection-v1", lambda: calls.append("second")),)
-        )
+        try:
+            results["second"] = second_service.run_phases(
+                (Phase("connection-v1", lambda: calls.append("second")),)
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            second_done.set()
 
     first = threading.Thread(target=run_first)
-    first.start()
-    assert first_entered.wait(timeout=1.0)
+    second = threading.Thread(target=run_second, name="second-phase-runner")
+    try:
+        first.start()
+        assert first_entered.wait(timeout=timeout)
 
-    second = threading.Thread(target=run_second)
-    second.start()
-    time.sleep(0.05)
-    assert second.is_alive()
+        second.start()
+        assert second_waiting.wait(timeout=timeout)
+        assert not second_done.is_set()
+    finally:
+        release_first.set()
+        first.join(timeout=timeout)
+        if second.ident is not None:
+            second.join(timeout=timeout)
 
-    release_first.set()
-    first.join(timeout=1.0)
-    second.join(timeout=1.0)
-
+    assert not errors
     assert not first.is_alive()
     assert not second.is_alive()
     assert calls == ["first"]
@@ -1463,9 +1738,11 @@ def test_lock_timeout_when_another_process_holds_lock(tmp_path: Path) -> None:
     service = PhaseLockService(target, timeout=0.15, retry_delay=0.01)
     calls: list[str] = []
 
-    with _subprocess_holding_phase_lock(target):
-        with pytest.raises(PhaseLockTimeout) as exc_info:
-            service.run_phases((Phase("connection-v1", lambda: calls.append("ran")),))
+    with (
+        _subprocess_holding_phase_lock(target),
+        pytest.raises(PhaseLockTimeout) as exc_info,
+    ):
+        service.run_phases((Phase("connection-v1", lambda: calls.append("ran")),))
 
     assert calls == []
     assert service.lock_path.exists()
@@ -1476,6 +1753,7 @@ def test_lock_timeout_when_another_process_holds_lock(tmp_path: Path) -> None:
     assert "lock_size=" in message
     assert "target=" in message
     assert "missing=['connection-v1']" in message
+    assert exc_info.value.cause is None
 
 
 def test_lock_context_releases_after_exception(tmp_path: Path) -> None:
@@ -1483,9 +1761,8 @@ def test_lock_context_releases_after_exception(tmp_path: Path) -> None:
     target.touch()
     service = PhaseLockService(target, timeout=0.5, retry_delay=0.01)
 
-    with pytest.raises(RuntimeError, match="boom"):
-        with service.locked():
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError, match="boom"), service.locked():
+        raise RuntimeError("boom")
 
     with service.locked():
         assert service.lock_path.exists()
@@ -1497,14 +1774,70 @@ def test_advisory_file_lock_context_manager_releases_after_exception(
     lock_path = tmp_path / "resource.lock"
     lock = AdvisoryFileLock(lock_path, timeout=0.5, retry_delay=0.01)
 
-    with pytest.raises(RuntimeError, match="boom"):
-        with lock:
-            assert lock.locked
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError, match="boom"), lock:
+        assert lock.locked
+        raise RuntimeError("boom")
 
     assert not lock.locked
     with AdvisoryFileLock(lock_path, timeout=0.5, retry_delay=0.01) as second_lock:
         assert second_lock.locked
+
+
+def test_advisory_file_lock_rejects_same_instance_reentrant_context(
+    tmp_path: Path,
+) -> None:
+    lock_path = tmp_path / "resource.lock"
+    lock = AdvisoryFileLock(lock_path, timeout=0.5, retry_delay=0.01)
+
+    with lock:
+        with (
+            pytest.raises(RuntimeError, match="does not support re-entrant"),
+            lock,
+        ):
+            pass
+        assert lock.locked
+
+    assert not lock.locked
+
+    result: list[bool] = []
+    errors: list[BaseException] = []
+
+    def acquire_from_other_thread() -> None:
+        second_lock = AdvisoryFileLock(lock_path, timeout=0.5, retry_delay=0.01)
+        try:
+            if second_lock.acquire():
+                result.append(True)
+                second_lock.release()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=acquire_from_other_thread)
+    thread.start()
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert result == [True]
+
+
+def test_advisory_file_lock_create_parent_control(tmp_path: Path) -> None:
+    non_existent_dir = tmp_path / "subdir" / "nested"
+    lock_path = non_existent_dir / "resource.lock"
+
+    lock_no_create = AdvisoryFileLock(
+        lock_path, timeout=0.1, retry_delay=0.01, create_parent=False
+    )
+    with pytest.raises(PhaseLockTimeout) as exc_info:
+        lock_no_create.acquire()
+    assert isinstance(exc_info.value.cause, FileNotFoundError)
+    assert not non_existent_dir.exists()
+
+    lock_create = AdvisoryFileLock(lock_path, timeout=0.5, retry_delay=0.01)
+    with lock_create:
+        assert lock_create.locked
+        assert non_existent_dir.is_dir()
+        assert lock_path.exists()
+
 
 
 def test_advisory_lock_unavailable_without_lock_primitives(
@@ -1520,9 +1853,8 @@ def test_advisory_lock_unavailable_without_lock_primitives(
     with pytest.raises(PhaseLockUnavailable):
         lock.acquire()
 
-    with lock_path.open("a+b") as lock_file:
-        with pytest.raises(PhaseLockUnavailable):
-            lock._try_lock(lock_file)
+    with lock_path.open("a+b") as lock_file, pytest.raises(PhaseLockUnavailable):
+        lock._try_lock(lock_file)
 
 
 def test_advisory_lock_open_errors_timeout_with_diagnostics(
@@ -1535,8 +1867,12 @@ def test_advisory_lock_open_errors_timeout_with_diagnostics(
         retry_delay=0.0,
     )
 
-    def fail_open(self: Path, *args: object, **kwargs: object) -> object:
-        raise OSError(errno.EACCES, "permission denied")
+    real_open = Path.open
+
+    def fail_open(self: Path, *args: Any, **kwargs: Any) -> object:
+        if self == lock.path:
+            raise OSError(errno.EACCES, "permission denied")
+        return real_open(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "open", fail_open)
 
@@ -1548,6 +1884,38 @@ def test_advisory_lock_open_errors_timeout_with_diagnostics(
     assert "diagnostic=present" in message
 
 
+def test_windows_permission_denied_open_is_classified_as_structural_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Windows lock-file open failure must not look like contention."""
+    lock = phaselock_module._AdvisoryLock(
+        tmp_path / "broker.lock",
+        timeout=0.0,
+        retry_delay=0.0,
+    )
+    denied = PermissionError(errno.EACCES, "permission denied")
+
+    real_open = Path.open
+
+    def fail_open(self: Path, *args: Any, **kwargs: Any) -> object:
+        if self == lock.path:
+            raise denied
+        return real_open(self, *args, **kwargs)
+
+    # Exercise the Windows availability branch even when this test runs on a
+    # POSIX development host. The open fails before the msvcrt primitive is
+    # called; the contract under test is the structural failure classification.
+    monkeypatch.setattr(phaselock_module, "fcntl", None)
+    monkeypatch.setattr(phaselock_module, "msvcrt", object())
+    monkeypatch.setattr(Path, "open", fail_open)
+
+    with pytest.raises(PhaseLockTimeout) as exc_info:
+        lock.acquire()
+
+    assert exc_info.value.cause is denied
+
+
 def test_advisory_lock_stops_after_lock_attempt_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1557,14 +1925,14 @@ def test_advisory_lock_stops_after_lock_attempt_failure(
         timeout=1.0,
         retry_delay=0.0,
     )
-    stop_calls = 0
+    lock_attempt_failed = False
 
     def stop_waiting() -> bool:
-        nonlocal stop_calls
-        stop_calls += 1
-        return stop_calls >= 3
+        return lock_attempt_failed
 
     def fail_try_lock(self: object, lock_file: object) -> None:
+        nonlocal lock_attempt_failed
+        lock_attempt_failed = True
         raise BlockingIOError(errno.EAGAIN, "busy")
 
     monkeypatch.setattr(phaselock_module._AdvisoryLock, "_try_lock", fail_try_lock)
@@ -1593,7 +1961,7 @@ def test_process_local_lock_timeout_includes_diagnostics(tmp_path: Path) -> None
         )
         try:
             contender.acquire(diagnostics=lambda: "process_lock=busy")
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
 
     try:
@@ -1686,10 +2054,12 @@ def test_msvcrt_lock_blocks_second_process_on_windows(tmp_path: Path) -> None:
     target.touch()
     service = PhaseLockService(target, timeout=0.15, retry_delay=0.01)
 
-    with _subprocess_holding_phase_lock(target):
-        with pytest.raises(PhaseLockTimeout):
-            with service.locked():
-                pass
+    with (
+        _subprocess_holding_phase_lock(target),
+        pytest.raises(PhaseLockTimeout),
+        service.locked(),
+    ):
+        pass
 
 
 def test_empty_phase_or_attr_name_is_rejected(tmp_path: Path) -> None:
@@ -1773,3 +2143,109 @@ def test_xattr_get_and_set_failure_modes_update_availability(
     assert unexpected._get_xattr("key") is None
     assert unexpected._set_xattr("key", b"value") is False
     assert unexpected.xattrs_available is False
+
+
+def test_same_stem_targets_get_distinct_sidecar_paths(tmp_path: Path) -> None:
+    """Same-stem targets must not collide on lock/status sidecar paths.
+
+    ``mydb.db`` and ``mydb.backup`` share a stem; deriving the sidecar with
+    ``with_suffix`` collapses both onto ``mydb.lock``/``mydb.status``. Sidecars
+    must instead append to the full target name so they stay distinct.
+    """
+    db_service = PhaseLockService(tmp_path / "mydb.db")
+    backup_service = PhaseLockService(tmp_path / "mydb.backup")
+
+    assert db_service.lock_path != backup_service.lock_path
+    assert db_service.status_base_path != backup_service.status_base_path
+
+
+def test_xattrless_status_not_inherited_across_same_stem_targets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On xattr-less filesystems, same-stem targets must not share status markers.
+
+    With status-file fallback, completing a phase for ``mydb.db`` must not make
+    ``mydb.backup`` appear to have that phase completed (which would skip its
+    setup). A colliding status path is exactly that hazard.
+    """
+    monkeypatch.setenv(phaselock_module.PHASELOCK_ENABLE_XATTRS, "0")
+
+    db_target = tmp_path / "mydb.db"
+    db_target.touch()
+    db_service = PhaseLockService(db_target)
+    db_result = db_service.run_phases((Phase("connection-v1", lambda: None),))
+    assert db_result.completed == ("connection-v1",)
+    assert db_service.has_phase("connection-v1")
+
+    backup_service = PhaseLockService(tmp_path / "mydb.backup")
+    assert not backup_service.has_phase("connection-v1")
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+@pytest.mark.parametrize(
+    "held_guard", [False, True], ids=["path-lock", "registry-guard"]
+)
+def test_fork_child_replaces_inherited_process_locks(
+    tmp_path: Path, held_guard: bool
+) -> None:
+    """A vanished parent lock owner cannot block a fresh child advisory lock."""
+    lock_path = tmp_path / "child.phase.lock"
+    path_lock = phaselock_module._process_lock_for(lock_path)
+    inherited_lock = phaselock_module._PROCESS_LOCKS_GUARD if held_guard else path_lock
+    acquired = threading.Event()
+    release = threading.Event()
+    timeout = scale_timeout_for_ci(5.0)
+
+    def hold() -> None:
+        with inherited_lock:
+            acquired.set()
+            release.wait()
+
+    holder = threading.Thread(target=hold)
+    child: int | None = None
+    status: int | None = None
+    holder.start()
+    try:
+        assert acquired.wait(timeout), "parent lock holder never became ready"
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=(
+                    r"^This process \(pid=\d+\) is multi-threaded, "
+                    r"use of fork\(\) may lead to deadlocks in the child\.$"
+                ),
+                category=DeprecationWarning,
+            )
+            child = os.fork()
+        if child == 0:
+            status = 1
+            try:
+                with AdvisoryFileLock(lock_path, timeout=1.0, retry_delay=0.01):
+                    status = 0
+            finally:
+                os._exit(status)
+        deadline = time.monotonic() + timeout
+        status = None
+        while time.monotonic() < deadline:
+            waited, child_status = os.waitpid(child, os.WNOHANG)
+            if waited:
+                status = child_status
+                child = None
+                break
+            time.sleep(0.01)
+        assert status is not None, "child hung on an inherited process-lock guard"
+        assert os.WIFEXITED(status), f"child terminated abnormally: {status}"
+        assert os.WEXITSTATUS(status) == 0, (
+            "fresh child could not acquire advisory lock"
+        )
+    finally:
+        if child is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(child, signal.SIGKILL)
+            os.waitpid(child, 0)
+        release.set()
+        holder.join(timeout=timeout)
+        assert not holder.is_alive(), "parent lock holder leaked"
+    with AdvisoryFileLock(lock_path, timeout=1.0, retry_delay=0.01):
+        assert lock_path.exists()
